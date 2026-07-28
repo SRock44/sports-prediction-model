@@ -58,3 +58,38 @@ def nba_season_for_date(d: date) -> int:
 def mlb_season_for_date(d: date) -> int:
     """MLB season is calendar-year based."""
     return d.year
+
+
+def wnba_season_for_date(d: date) -> int:
+    """WNBA season is calendar-year based (runs May-September within one year)."""
+    return d.year
+
+
+def nfl_season_for_date(d: date) -> int:
+    """Return the NFL season year for a given date.
+
+    NFL seasons start in September and run through the Super Bowl in February;
+    we label by the calendar year in which the season begins (matches
+    nfl_data_py/nflverse convention: the 2026 season covers Sep 2026-Feb 2027).
+    """
+    return d.year if d.month >= 3 else d.year - 1
+
+
+def nhl_season_for_date(d: date) -> int:
+    """NHL season runs October-June; label by the calendar year the season begins
+    (matches the NHL API's own `season` convention, e.g. 20242025 encodes the
+    2024-25 season — this returns the leading year, 2024)."""
+    return d.year if d.month >= 10 else d.year - 1
+
+
+def soccer_season_for_date(d: date) -> int:
+    """Top-5 European league season runs August-May; label by the calendar year the
+    season begins (matches Understat/soccerdata's own season convention, e.g.
+    "2024-2025" -> season_start_year=2024 — this returns that leading year)."""
+    return d.year if d.month >= 7 else d.year - 1
+
+
+def nascar_season_for_date(d: date) -> int:
+    """NASCAR Cup season is calendar-year based (runs Feb-Nov within one year),
+    same shape as MLB/WNBA's helpers above."""
+    return d.year

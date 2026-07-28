@@ -34,7 +34,13 @@ log = get_logger(__name__)
 QUANTILES = [0.10, 0.25, 0.50, 0.75, 0.90]
 
 # Recency decay: props are more player-specific, so higher λ (forgets faster)
-_LAMBDA = {"nba": 0.50, "mlb": 0.40}
+_LAMBDA = {
+    "nba": 0.50,
+    "mlb": 0.40,
+    "nhl": 0.50,  # matches nba's daily-cadence props decay
+    "nascar": 0.25,  # matches the winner model's "nascar": 0.20 in train_winner.py,
+    # slightly faster since finishing position is more form-sensitive race-to-race
+}
 
 _LGB_DEVICE = "gpu" if _lgb_gpu_available() else "cpu"
 

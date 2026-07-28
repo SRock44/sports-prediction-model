@@ -185,11 +185,16 @@ def load_injuries_before(
 
 
 def load_game_odds(session: Session, game_id: int) -> dict[str, Any]:
-    """Return implied probability and spread from stored odds. Graceful on missing table."""
+    """Return implied probability and spread from stored odds. Graceful on missing table.
+
+    `draw_price` (added for soccer's three-way market) is NULL for every other
+    sport's rows, so the two-outcome path below is unchanged for existing callers (NHL/NBA/etc.) -
+    only rows that actually populate draw_price take the vig-removed three-way branch.
+    """
     try:
         result = session.execute(
             text("""
-                SELECT market, snapshot, home_price, away_price, home_spread
+                SELECT market, snapshot, home_price, away_price, draw_price, home_spread
                 FROM game_odds
                 WHERE game_id = :gid
                 ORDER BY snapshot DESC
@@ -212,7 +217,17 @@ def load_game_odds(session: Session, game_id: int) -> dict[str, Any]:
     for row in rows:
         if row["market"] == "h2h" and row["home_price"] is not None:
             snap = row["snapshot"]
-            out[f"odds_{snap}_implied_home"] = american_to_prob(row["home_price"])
+            p_home = american_to_prob(row["home_price"])
+            draw_price = row.get("draw_price")
+            if draw_price is not None and row["away_price"] is not None:
+                p_draw = american_to_prob(draw_price)
+                p_away = american_to_prob(row["away_price"])
+                total = p_home + p_draw + p_away
+                out[f"odds_{snap}_implied_home"] = p_home / total
+                out[f"odds_{snap}_implied_draw"] = p_draw / total
+                out[f"odds_{snap}_implied_away"] = p_away / total
+            else:
+                out[f"odds_{snap}_implied_home"] = p_home
             out[f"odds_{snap}_home_price"] = row["home_price"]
         if row["market"] == "spreads" and row["home_spread"] is not None:
             out[f"odds_{row['snapshot']}_spread"] = row["home_spread"]

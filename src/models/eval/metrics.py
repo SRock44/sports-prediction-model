@@ -19,6 +19,38 @@ def compute_all_winner_metrics(
     }
 
 
+def compute_all_winner_metrics_multiclass(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> dict[str, float]:
+    """K-class analog of compute_all_winner_metrics - for a three-way (e.g. soccer 1X2)
+    market (K=3), not a change to the binary version above (every other sport's caller
+    is untouched).
+
+    - brier: multiclass Brier score (mean squared error between one-hot true label and the
+      predicted probability vector, averaged over classes) - the standard K-class
+      generalization, reduces to the binary Brier score when K=2.
+    - ece: top-1 confidence calibration (bins by the *predicted* class's own probability,
+      compares to how often that top pick was actually correct) - the standard multiclass ECE
+      definition, distinct from the binary version's P(class 1) binning.
+    """
+    n_classes = y_prob.shape[1]
+    one_hot = np.eye(n_classes)[y_true]
+    brier = float(np.mean(np.sum((y_prob - one_hot) ** 2, axis=1)))
+
+    pred_class = y_prob.argmax(axis=1)
+    confidence = y_prob.max(axis=1)
+    correct = (pred_class == y_true).astype(float)
+
+    return {
+        "logloss": float(log_loss(y_true, y_prob, labels=list(range(n_classes)))),
+        "brier": brier,
+        "accuracy": float(np.mean(correct)),
+        "ece": compute_ece(correct, confidence),
+        "n_samples": len(y_true),
+    }
+
+
 def compute_ece(
     y_true: np.ndarray,
     y_prob: np.ndarray,
