@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sports-prediction-model"
 version = "0.1.0"
-description = "NBA/MLB game-winner and player-prop model training and feature engineering code"
+description = "Multi-sport (NBA/WNBA/MLB/NFL/NHL/soccer/NASCAR) game-winner and player-prop model training and feature engineering code"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
