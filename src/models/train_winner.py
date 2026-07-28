@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import optuna
@@ -32,7 +34,47 @@ from src.models.registry import log_model_run
 
 log = get_logger(__name__)
 
-_LAMBDA = {"nba": 0.30, "mlb": 0.50}
+
+# MLflow's tracking API stores every logged param as a string; a champion retrain
+# reloads them via fixed_params and passes them straight into the base-learner
+# constructors. XGBoost/LightGBM tolerate numeric strings, but CatBoost's C++
+# param parser doesn't and raises CatBoostError. Coerce back to real int/float
+# using each key's known type on the way in.
+def _coerce_fixed_params(params: dict, int_keys: frozenset[str]) -> dict:
+    coerced = {}
+    for k, v in params.items():
+        if not isinstance(v, str):
+            coerced[k] = v
+        elif k in int_keys:
+            coerced[k] = int(v)
+        else:
+            coerced[k] = float(v)
+    return coerced
+
+
+# Promotion margins. A season with only a few hundred holdout games has a much
+# larger standard error on log-loss than a daily-cadence sport with thousands -
+# using the same tight margin for both means a small-sample sport's champion
+# flips on pure noise. Small-sample sports get a wider margin, still under one
+# standard error but at least asking for a real signal.
+_MIN_LOGLOSS_IMPROVEMENT = 0.005
+_MIN_LOGLOSS_IMPROVEMENT_SMALL_SAMPLE = 0.02
+# nascar: per-driver-per-race win rate is a rare event (~1/37) - a small logloss
+# delta between challenger and champion is more likely to be noise here than for
+# a typical team-sport binary target, same reasoning a short season already
+# applies for a different reason (small sample size).
+_SMALL_SAMPLE_SPORTS = frozenset({"nfl", "nascar"})
+
+_LAMBDA = {
+    "nba": 0.30,
+    "mlb": 0.50,
+    # NFL: deliberately the slowest decay of any sport (default fallthrough
+    # below is 0.25) - a 17-game season can't afford to aggressively discount
+    # early-season games the way MLB discounts April with 162 games to lean on.
+    "nfl": 0.18,
+    "nhl": 0.30,  # same daily-cadence season shape as nba
+    "nascar": 0.20,  # ~36 races/season - denser than NFL's 17, sparser than NBA's 82
+}
 
 try:
     import lightgbm as lgb
@@ -49,17 +91,24 @@ except ImportError:
     _HAS_CAT = False
 
 
-# Probe for CUDA via XGBoost's own device check — works inside containers
-# without requiring nvidia-smi on PATH.
+# Checks for a real, functioning NVIDIA driver directly rather than trusting
+# XGBoost's device="cuda" fit() to raise when unavailable - newer XGBoost
+# versions silently fall back to CPU with just a warning ("Falling back to
+# prediction using DMatrix due to mismatched devices") instead of raising, so
+# a fit()-based probe can return a false positive on GPU-less hosts. That false
+# positive is harmless for XGBoost/LightGBM (both have their own silent CPU
+# fallback) but fatal for CatBoost, which has no such fallback and hard-crashes
+# with "CUDA driver version is insufficient" when task_type is set to "GPU"
+# without a real driver behind it.
 def _cuda_available() -> bool:
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi") is None:
+        return False
     try:
-        import xgboost as _xgb
-
-        _probe = _xgb.XGBClassifier(device="cuda", n_estimators=1, verbosity=0)
-        import numpy as _np
-
-        _probe.fit(_np.zeros((4, 2)), [0, 1, 0, 1], verbose=False)
-        return True
+        result = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5, check=False)
+        return result.returncode == 0
     except Exception:
         return False
 
@@ -87,11 +136,22 @@ _LGB_DEVICE = "gpu" if _lgb_gpu_available() else "cpu"
 
 # LightGBM defaults n_jobs=-1 (every logical core) regardless of device="gpu" -
 # GPU only offloads the histogram kernel, everything else still spins up
-# LightGBM's full CPU thread pool. train_challenger/train_props run both
-# sports concurrently, so two uncapped processes can oversubscribe every core
-# at once (root cause of the 2026-07-10 thermal incident - 102C package temp
-# in a small ITX case). Cap it so concurrent runs can't do that.
-_LGB_N_JOBS = 4
+# LightGBM's full CPU thread pool. Running challenger/props training for
+# multiple sports concurrently means uncapped processes can oversubscribe every
+# core at once - this caused a real thermal incident on a thermally-marginal
+# host. Cap it so concurrent runs can't do that.
+#
+# Env-configurable rather than hardcoded: this value needs to differ between
+# deployment targets sharing one codebase (a big dedicated training box vs. a
+# small/thermally-marginal dev machine) - a literal here is either right for
+# one or right for the other, never both. Default (16) is a reasonable ceiling
+# for a dedicated multi-core training host; override down for smaller hardware.
+_LGB_N_JOBS = int(os.environ.get("LGB_N_JOBS", "16"))
+
+# CatBoost's CPU mode (task_type="CPU", used whenever _GPU is False) defaults
+# thread_count=-1 (every core) same as LightGBM above - same thermal risk, same
+# env-configurable approach, same default as _LGB_N_JOBS above.
+_CAT_N_JOBS = int(os.environ.get("CAT_N_JOBS", "16"))
 
 
 def _optuna_callback(model_tag: str, n_trials: int, start_time: float):
@@ -157,12 +217,30 @@ class StackedEnsemble:
         lgb_clf=None,
         cat_clf=None,
         meta=None,
+        proba_clip: float = 1e-6,
+        iso_blend_weight: float = 0.7,
     ) -> None:
         self.xgb_clf = xgb_clf
         self.lgb_clf = lgb_clf
         self.cat_clf = cat_clf
         self.meta = meta  # fitted LogisticRegression or None
         self.iso = iso
+        # Weight on the isotonic-calibrated probability vs. the raw ensemble
+        # score in the final blend (see predict_proba). 1.0 = pure isotonic.
+        self.iso_blend_weight = iso_blend_weight
+        # How far from 0/1 predict_proba is clamped. Default (1e-6) barely
+        # avoids a log(0) crash but still allows near-certain predictions that
+        # are catastrophic when wrong under log-loss. A small-sample sport's
+        # isotonic regression is prone to outputting a literal 1.000 for a
+        # holdout game that then loses - one such game can contribute a
+        # meaningful fraction of the entire holdout's total log-loss. Isotonic
+        # regression saturates like this with small calibration sets: it can
+        # map some input range to a hard 0/1 if the calibration data happened
+        # to be unanimous there, with no cushion for real-world uncertainty a
+        # sports outcome always has. A wider clip (e.g. 0.03) is passed for
+        # small-sample sports at construction time; the daily-cadence sports
+        # keep the original 1e-6 default.
+        self.proba_clip = proba_clip
         self.classes_ = np.array([0, 1])
 
     def _base_proba_matrix(self, X: np.ndarray) -> np.ndarray:
@@ -181,7 +259,23 @@ class StackedEnsemble:
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         raw = self._raw_proba(X)
-        cal = np.clip(self.iso.predict(raw), 1e-6, 1.0 - 1e-6)
+        # getattr, not self.<attr>: models pickled before these attributes
+        # existed must not crash scoring on every game just because an older
+        # artifact predates a field added since.
+        clip = getattr(self, "proba_clip", 1e-6)
+        cal_iso = self.iso.predict(raw)
+        # Isotonic regression (PAV) fits a piecewise-*constant* step function.
+        # With a modest calibration set, some steps end up wide and flat -
+        # every game whose raw score falls in that band (often most of a
+        # day's slate, since raw scores cluster narrowly too) then displays
+        # identical confidence, which looks like a bug even though the
+        # calibration itself is technically correct. Blending back in a slice
+        # of the raw, continuous ensemble score restores per-game variance
+        # inside those flat segments while the isotonic term still anchors the
+        # output near its true calibrated rate.
+        iso_weight = getattr(self, "iso_blend_weight", 0.7)
+        blended = iso_weight * cal_iso + (1.0 - iso_weight) * raw
+        cal = np.clip(blended, clip, 1.0 - clip)
         return np.column_stack([1.0 - cal, cal])
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -222,6 +316,7 @@ def train_winner_model(
     fixed_params: dict | None = None,
 ) -> tuple[str, dict[str, float]]:
     """Train calibrated ensemble model. Returns (mlflow_run_id, metrics_dict)."""
+    _run_t0 = time.time()
     lam = _LAMBDA.get(sport, 0.25)
 
     # Ensure all expected feature columns exist — new features added to the config
@@ -297,9 +392,17 @@ def train_winner_model(
     # Constrained bounds (default) prevent the Run-4 failure where Optuna found
     # max_depth=10 / n_estimators=4115 that overfit CV but collapsed on holdout.
     # wide_search=True is reserved for monthly deep-exploration runs only.
-    _xgb_n_est_hi = 5000 if wide_search else 2000
-    _xgb_depth_hi = 10 if wide_search else 8
+    #
+    # is_small_sample tightens further, on top of the narrow defaults: a
+    # small-sample sport's training set is a fraction of the daily-cadence
+    # sports' size, and an untightened search on that little data can produce
+    # a holdout log-loss worse than the naive always-0.5 baseline despite good
+    # accuracy - a textbook overfit/miscalibration signature.
+    is_small_sample = sport in _SMALL_SAMPLE_SPORTS
+    _xgb_n_est_hi = 5000 if wide_search else (600 if is_small_sample else 2000)
+    _xgb_depth_hi = 10 if wide_search else (5 if is_small_sample else 8)
     _xgb_lr_lo = 0.001 if wide_search else 0.005
+    _xgb_min_child_lo = 5 if is_small_sample else 1
 
     def xgb_objective(trial: optuna.Trial) -> float:
         params = {
@@ -309,9 +412,11 @@ def train_winner_model(
             "subsample": trial.suggest_float("subsample", 0.4, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
             "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.3, 1.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+            "min_child_weight": trial.suggest_int("min_child_weight", _xgb_min_child_lo, 30),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 100.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 100.0, log=True),
+            "reg_lambda": trial.suggest_float(
+                "reg_lambda", 1.0 if is_small_sample else 0.1, 100.0, log=True
+            ),
             "gamma": trial.suggest_float("gamma", 0.0, 1.5),
         }
         fold_losses = []
@@ -337,11 +442,14 @@ def train_winner_model(
 
     if fixed_params is not None:
         # Use caller-supplied params directly (e.g. champion retrain) — no search, no file write
-        best_xgb_params = {
-            k[4:]: v
-            for k, v in fixed_params.items()
-            if k.startswith("xgb_") and k != "xgb_best_n_trees"
-        }
+        best_xgb_params = _coerce_fixed_params(
+            {
+                k[4:]: v
+                for k, v in fixed_params.items()
+                if k.startswith("xgb_") and k != "xgb_best_n_trees"
+            },
+            int_keys=frozenset({"n_estimators", "max_depth", "min_child_weight"}),
+        )
         print(f"[XGBoost] Using fixed params (champion retrain): {best_xgb_params}\n")
         log.info("optuna.xgb_fixed", sport=sport, params=best_xgb_params)
     elif n_optuna_trials == 0 and os.path.exists(_params_path):
@@ -427,8 +535,9 @@ def train_winner_model(
     best_lgb_params: dict = {}
 
     if _HAS_LGB:
-        _lgb_leaves_hi = 200 if wide_search else 80
-        _lgb_n_est_hi = 3000 if wide_search else 1500
+        _lgb_leaves_hi = 200 if wide_search else (31 if is_small_sample else 80)
+        _lgb_n_est_hi = 3000 if wide_search else (600 if is_small_sample else 1500)
+        _lgb_min_child_lo = 20 if is_small_sample else 5
 
         def lgb_objective(trial: optuna.Trial) -> float:
             params = {
@@ -437,9 +546,11 @@ def train_winner_model(
                 "n_estimators": trial.suggest_int("n_estimators", 200, _lgb_n_est_hi),
                 "subsample": trial.suggest_float("subsample", 0.5, 1.0),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-                "min_child_samples": trial.suggest_int("min_child_samples", 5, 60),
+                "min_child_samples": trial.suggest_int("min_child_samples", _lgb_min_child_lo, 60),
                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float(
+                    "reg_lambda", 1e-2 if is_small_sample else 1e-8, 10.0, log=True
+                ),
             }
             fold_losses = []
             for X_tr, y_tr, w_tr, X_val, y_val, w_val in cv_folds:
@@ -466,11 +577,14 @@ def train_winner_model(
         _lgb_actual_trials = n_optuna_trials if n_optuna_trials > 0 else 0
 
         if fixed_params is not None:
-            best_lgb_params = {
-                k[4:]: v
-                for k, v in fixed_params.items()
-                if k.startswith("lgb_") and k != "lgb_best_n_trees"
-            }
+            best_lgb_params = _coerce_fixed_params(
+                {
+                    k[4:]: v
+                    for k, v in fixed_params.items()
+                    if k.startswith("lgb_") and k != "lgb_best_n_trees"
+                },
+                int_keys=frozenset({"num_leaves", "n_estimators", "min_child_samples"}),
+            )
             print(f"[LightGBM] Using fixed params (champion retrain): {best_lgb_params}\n")
             log.info("optuna.lgb_fixed", sport=sport, params=best_lgb_params)
         elif _lgb_actual_trials == 0 and os.path.exists(_lgb_params_path):
@@ -537,13 +651,17 @@ def train_winner_model(
 
     if _HAS_CAT:
         _cat_params_path = f"reports/{sport}_winner_cat_params.json"
+        _cat_iter_hi = 500 if is_small_sample else 1500
+        _cat_depth_hi = 5 if is_small_sample else 8
 
         def cat_objective(trial: optuna.Trial) -> float:
             params = {
-                "iterations": trial.suggest_int("iterations", 200, 1500),
-                "depth": trial.suggest_int("depth", 4, 8),
+                "iterations": trial.suggest_int("iterations", 200, _cat_iter_hi),
+                "depth": trial.suggest_int("depth", 4, _cat_depth_hi),
                 "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
-                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 20.0, log=True),
+                "l2_leaf_reg": trial.suggest_float(
+                    "l2_leaf_reg", 3.0 if is_small_sample else 1.0, 20.0, log=True
+                ),
                 "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
                 "random_strength": trial.suggest_float("random_strength", 0.0, 1.0),
             }
@@ -553,6 +671,7 @@ def train_winner_model(
                     **params,
                     loss_function="Logloss",
                     task_type="GPU" if _GPU else "CPU",
+                    thread_count=-1 if _GPU else _CAT_N_JOBS,
                     random_seed=42,
                     verbose=0,
                 )
@@ -562,7 +681,10 @@ def train_winner_model(
             return float(np.mean(fold_losses))
 
         if fixed_params is not None:
-            best_cat_params = {k[4:]: v for k, v in fixed_params.items() if k.startswith("cat_")}
+            best_cat_params = _coerce_fixed_params(
+                {k[4:]: v for k, v in fixed_params.items() if k.startswith("cat_")},
+                int_keys=frozenset({"iterations", "depth"}),
+            )
             print(f"[CatBoost] Using fixed params (champion retrain): {best_cat_params}\n")
         elif n_optuna_trials == 0 and os.path.exists(_cat_params_path):
             with open(_cat_params_path) as _f:
@@ -596,6 +718,7 @@ def train_winner_model(
             **best_cat_params,
             loss_function="Logloss",
             task_type="GPU" if _GPU else "CPU",
+            thread_count=-1 if _GPU else _CAT_N_JOBS,
             random_seed=42,
             verbose=0,
         )
@@ -644,6 +767,10 @@ def train_winner_model(
         lgb_clf=lgb_clf,
         cat_clf=cat_clf,
         meta=meta_learner,
+        # Small calibration sets make isotonic regression prone to saturating
+        # at hard 0/1 for some input range - see StackedEnsemble.__init__'s
+        # docstring for why small-sample sports need a wider clip.
+        proba_clip=0.03 if is_small_sample else 1e-6,
     )
 
     # ── Evaluate on holdout ───────────────────────────────────────────────────
@@ -699,20 +826,43 @@ def train_winner_model(
         model_framework="sklearn",
     )
 
+    total_elapsed = time.time() - _run_t0
+    finished_et = datetime.now(ZoneInfo("America/New_York"))
+    print(
+        f"[Run] Total elapsed: {total_elapsed / 60:.1f} min "
+        f"({total_elapsed:.0f}s) — finished {finished_et.strftime('%Y-%m-%d %I:%M:%S %p %Z')}\n"
+    )
+    log.info(
+        "winner.run_complete",
+        sport=sport,
+        total_elapsed_seconds=round(total_elapsed, 1),
+        finished_et=finished_et.isoformat(),
+    )
+
     return run_id, metrics
 
 
 def should_promote(
     challenger_metrics: dict[str, float],
     champion_metrics: dict[str, float],
-    min_logloss_improvement: float = 0.005,
+    min_logloss_improvement: float | None = None,
     max_ece_increase: float = 0.02,
     max_brier_increase: float = 0.005,
+    sport: str | None = None,
 ) -> tuple[bool, str]:
     """Promotion gate. Log-loss is primary; Brier/ECE are sanity checks only.
 
+    min_logloss_improvement resolves per-sport when not passed explicitly:
+    small-sample sports demand a wider margin than the daily-cadence sports do.
+
     Returns (should_promote, reason).
     """
+    if min_logloss_improvement is None:
+        min_logloss_improvement = (
+            _MIN_LOGLOSS_IMPROVEMENT_SMALL_SAMPLE
+            if sport in _SMALL_SAMPLE_SPORTS
+            else _MIN_LOGLOSS_IMPROVEMENT
+        )
     chall_ll = challenger_metrics.get("logloss", 999)
     champ_ll = champion_metrics.get("logloss", 999)
     chall_ece = challenger_metrics.get("ece", 999)
